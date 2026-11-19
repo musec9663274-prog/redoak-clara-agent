@@ -1,0 +1,18 @@
+# RedOak Clara — Render Blueprint (one Docker web service, free plan)
+services:
+  - type: web
+    name: redoak-clara-agent
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: LLM_BACKEND
+        value: openai-compatible
+      - key: WHISPER_MODEL
+        value: tiny
+      - key: KOKORO_VOICE
+        value: af_heart
+      # NOTE: replace with the real hostname after the first deploy, then redeploy.
+      - key: PUBLIC_HOST
+        value: redoak-clara-agent.onrender.com

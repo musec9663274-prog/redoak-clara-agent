@@ -1,0 +1,11 @@
+# RedOak Clara — Render deploy requirements (no torch: Pipecat 1.16 uses kokoro-onnx)
+pipecat-ai==1.16.0
+faster-whisper==1.2.1
+kokoro-onnx==0.6.1
+onnxruntime==1.32.0
+fastapi==0.163.2
+uvicorn==0.54.0
+# Needed for FastAPI UploadFile (multipart wav upload on /talk)
+python-multipart==0.0.20
+# Needed by pipecat's KokoroTTSService (downloads model files on first use)
+requests==2.34.2

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+models/
+.cache/
+.tmp/
+leads/*.json
+!leads/.gitkeep
+test-*.wav
+talk-response.json
