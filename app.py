@@ -4,6 +4,9 @@ One FastAPI app for Render (Docker, free plan):
   - GET  /health        liveness + model status (also used by the keep-warm cron)
   - POST /twilio-voice  TwiML: streams the call to wss://<PUBLIC_HOST>/ws
   - WS   /ws            Twilio media stream -> Pipecat pipeline (STT + LLM + TTS)
+  - POST /plivo-voice   Plivo XML: streams the call to wss://<PUBLIC_HOST>/ws-plivo
+  - WS   /ws-plivo      Plivo audio stream -> same Pipecat pipeline
+  - POST /plivo-call    Dial out through Plivo (Clara calls a number)
   - POST /talk          wav upload -> Clara reply (JSON with base64 wav, or ?format=wav)
 
 Stack: Pipecat 1.16 + faster-whisper (tiny) + kokoro-onnx (af_heart).
@@ -14,7 +17,8 @@ Env vars (see render.yaml / README.md):
   PORT, PUBLIC_HOST (hostname only, no scheme/port), LLM_BACKEND,
   POLLINATIONS_BASE_URL, POLLINATIONS_MODEL, OLLAMA_BASE_URL, OLLAMA_MODEL,
   WHISPER_MODEL, KOKORO_VOICE, KOKORO_MODEL_PATH, KOKORO_VOICES_PATH,
-  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, LEADS_DIR, MAX_CALL_SECONDS.
+  TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN,
+  PLIVO_FROM_NUMBER, PLIVO_CALL_TOKEN, LEADS_DIR, MAX_CALL_SECONDS.
 
 Rebuilt 20 Nov 2026 from the handover spec (previous workspace was lost
 with the old VM). Behaviour matches the old bot.py + talk_server.py:
@@ -61,6 +65,17 @@ KOKORO_VOICES_PATH = os.environ.get(
 )
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+# Plivo (Audio Streaming leg). No account exists yet — everything below
+# works without these until the account/number is set up: /plivo-voice
+# answers with XML regardless, /ws-plivo runs with auto_hang_up disabled,
+# and /plivo-call fails cleanly with a JSON error.
+PLIVO_AUTH_ID = os.environ.get("PLIVO_AUTH_ID", "")
+PLIVO_AUTH_TOKEN = os.environ.get("PLIVO_AUTH_TOKEN", "")
+PLIVO_FROM_NUMBER = os.environ.get("PLIVO_FROM_NUMBER", "")
+# Optional shared secret for POST /plivo-call: when set, the endpoint
+# requires header X-Plivo-Call-Token with this value (dial-out spends
+# money, so it should not be open to anyone who finds the URL).
+PLIVO_CALL_TOKEN = os.environ.get("PLIVO_CALL_TOKEN", "")
 LEADS_DIR = Path(os.environ.get("LEADS_DIR", str(BASE_DIR / "leads")))
 MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "300"))
 
@@ -349,7 +364,15 @@ async def health():
 async def index():
     return {
         "service": "RedOak Clara Agent",
-        "endpoints": ["GET /health", "POST /twilio-voice", "WS /ws", "POST /talk"],
+        "endpoints": [
+            "GET /health",
+            "POST /twilio-voice",
+            "WS /ws",
+            "POST /plivo-voice",
+            "WS /ws-plivo",
+            "POST /plivo-call",
+            "POST /talk",
+        ],
     }
 
 
@@ -527,6 +550,310 @@ async def twilio_ws(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Plivo voice webhook -> Plivo XML (Audio Streaming)
+# ---------------------------------------------------------------------------
+
+
+@app.api_route("/plivo-voice", methods=["GET", "POST"])
+async def plivo_voice():
+    """Plivo Answer URL: return XML that streams the call to /ws-plivo.
+
+    Works with no Plivo credentials configured — this is just the XML
+    answer; credentials are only needed for dial-out and auto hang-up.
+    Plivo calls the Answer URL with the method configured on the XML
+    application (GET or POST), so both are accepted. The <Stream> URL
+    is the WebSocket endpoint's address as text content, per Plivo's
+    Audio Streaming docs (bidirectional=true for two-way audio,
+    keepCallAlive=true so the call survives the stream ending).
+    """
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<Response>\n"
+        f'  <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">wss://{PUBLIC_HOST}/ws-plivo</Stream>\n'
+        "</Response>\n"
+    )
+    return PlainTextResponse(xml, media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# Plivo audio stream -> Pipecat pipeline (same Clara as the Twilio leg)
+# ---------------------------------------------------------------------------
+
+
+@app.websocket("/ws-plivo")
+async def plivo_ws(websocket: WebSocket):
+    await websocket.accept()
+    log.info("plivo websocket connected")
+
+    # Plivo sends a "start" event first with stream/call IDs, per its
+    # Audio Streaming protocol reference:
+    # {"event": "start", "sequenceNumber": 1,
+    #  "start": {"callId": ..., "streamId": ..., "accountId": ...,
+    #            "tracks": [...], "mediaFormat": {...}}, ...}
+    stream_id = None
+    call_id = None
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            data = json.loads(msg)
+            if data.get("event") == "start":
+                start = data.get("start", {}) or {}
+                # Official schema nests the IDs under "start"; accept the
+                # top-level keys too (older Plivo versions / test tools).
+                stream_id = start.get("streamId") or data.get("streamId")
+                call_id = start.get("callId") or data.get("callId")
+                log.info("plivo start: stream=%s call=%s", stream_id, call_id)
+                break
+            # Ignore anything before start (there should be nothing).
+    except WebSocketDisconnect:
+        log.info("plivo websocket disconnected before start")
+        return
+    except Exception:
+        log.exception("error waiting for plivo start event")
+        return
+
+    if not stream_id:
+        log.error("plivo start event missing stream ID")
+        await websocket.close()
+        return
+    # callId is required by the Plivo schema; if it is missing anyway,
+    # keep going without auto hang-up (the serializer needs a real one).
+    real_call_id = call_id
+    if not call_id:
+        log.warning("plivo start event missing call ID, continuing without it")
+        call_id = f"plivo-{stream_id}"
+
+    # Same lazy Pipecat imports as the Twilio leg, so /health and /talk
+    # keep working even if the realtime stack has an issue. The pipeline
+    # below is the same STT -> LLM -> TTS Clara (same prompt/KB, same
+    # models); only the serializer changes (PlivoFrameSerializer ships
+    # in pipecat core, same as TwilioFrameSerializer).
+    from pipecat.audio.vad.silero import SileroVADAnalyzer
+    from pipecat.frames.frames import LLMRunFrame
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import (
+        LLMContextAggregatorPair,
+    )
+    from pipecat.processors.audio.vad_processor import VADProcessor
+    from pipecat.serializers.plivo import PlivoFrameSerializer
+    from pipecat.services.kokoro.tts import KokoroTTSService
+    from pipecat.services.openai.llm import OpenAILLMService
+    from pipecat.services.whisper.stt import WhisperSTTService
+    from pipecat.transports.websocket.fastapi import (
+        FastAPIWebsocketParams,
+        FastAPIWebsocketTransport,
+    )
+
+    base_url, model = llm_client_kwargs()
+
+    # PlivoFrameSerializer raises ValueError if auto_hang_up is on but
+    # call_id/auth_id/auth_token are missing — disable it (and warn)
+    # instead of crashing when the account is not configured yet.
+    if PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN and real_call_id:
+        serializer = PlivoFrameSerializer(
+            stream_id, real_call_id, PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN
+        )
+    else:
+        log.warning(
+            "plivo: credentials/call ID missing, auto_hang_up disabled "
+            "(call ends when the caller hangs up or the stream closes)"
+        )
+        serializer = PlivoFrameSerializer(
+            stream_id,
+            real_call_id,
+            params=PlivoFrameSerializer.InputParams(auto_hang_up=False),
+        )
+
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            add_wav_header=False,
+            serializer=serializer,
+        ),
+    )
+
+    stt = WhisperSTTService(model=WHISPER_MODEL)
+    llm = OpenAILLMService(api_key="not-needed", base_url=base_url, model=model)
+    # Reuse the pre-downloaded Kokoro models (Dockerfile); the service would
+    # otherwise download the same files again on first use.
+    tts = KokoroTTSService(
+        voice_id=KOKORO_VOICE,
+        model_path=KOKORO_MODEL_PATH,
+        voices_path=KOKORO_VOICES_PATH,
+    )
+
+    context = LLMContext(
+        [
+            {"role": "system", "content": SYSTEM_WITH_KB},
+        ]
+    )
+    context_aggregator = LLMContextAggregatorPair(context)
+
+    pipeline = Pipeline(
+        [
+            transport.input(),
+            VADProcessor(vad_analyzer=SileroVADAnalyzer()),
+            stt,
+            context_aggregator.user(),
+            llm,
+            tts,
+            transport.output(),
+            context_aggregator.assistant(),
+        ]
+    )
+
+    worker = PipelineWorker(
+        pipeline,
+        params=PipelineParams(
+            enable_metrics=True,
+            enable_usage_metrics=True,
+        ),
+        idle_timeout_secs=MAX_CALL_SECONDS,
+    )
+
+    # Greet first: the system prompt tells Clara to open with FIRST_MESSAGE.
+    @worker.event_handler("on_pipeline_started")
+    async def on_pipeline_started(worker, frame):
+        await worker.queue_frames([LLMRunFrame()])
+
+    runner = PipelineRunner(handle_sigint=False)
+    try:
+        await asyncio.wait_for(runner.run(worker), timeout=MAX_CALL_SECONDS)
+    except asyncio.TimeoutError:
+        log.info("call %s reached max duration (%ss), ending", call_id, MAX_CALL_SECONDS)
+        await worker.cancel()
+    except WebSocketDisconnect:
+        log.info("plivo websocket disconnected during call %s", call_id)
+    except Exception:
+        log.exception("error in pipecat pipeline for call %s", call_id)
+    finally:
+        try:
+            messages = context.get_messages()
+        except Exception:
+            messages = []
+        save_lead(
+            f"{call_id}.json",
+            {
+                "source": "plivo",
+                "call_id": call_id,
+                "stream_id": stream_id,
+                "ended_at": datetime.now(timezone.utc).isoformat(),
+                "messages": messages,
+            },
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Plivo dial-out trigger (Clara calls a number)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/plivo-call")
+async def plivo_call(request: Request):
+    """Dial out through Plivo: Clara calls the given number.
+
+    Body: {"to": "+1...", "from": "<Plivo number, optional>",
+           "answer_url": "<optional override, default /plivo-voice>"}
+    The call's Answer URL points at /plivo-voice, which streams the
+    answered call to the Pipecat pipeline on /ws-plivo.
+
+    Fails cleanly (JSON error, no crash) until the Plivo account is
+    configured: PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN env vars and a
+    voice-enabled Plivo number (PLIVO_FROM_NUMBER env or "from" in
+    the body). When PLIVO_CALL_TOKEN is set, the request must carry
+    header X-Plivo-Call-Token with the same value.
+    """
+    if PLIVO_CALL_TOKEN and request.headers.get("x-plivo-call-token") != PLIVO_CALL_TOKEN:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON body must be an object"}, status_code=400)
+
+    to_number = str(body.get("to") or "").strip()
+    from_number = str(body.get("from") or PLIVO_FROM_NUMBER or "").strip()
+    answer_url = str(
+        body.get("answer_url") or f"https://{PUBLIC_HOST}/plivo-voice"
+    ).strip()
+
+    if not to_number:
+        return JSONResponse({"error": "missing 'to' phone number"}, status_code=400)
+    if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
+        return JSONResponse(
+            {"error": "Plivo credentials not configured (PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN)"},
+            status_code=503,
+        )
+    if not from_number:
+        return JSONResponse(
+            {"error": "no Plivo caller number configured (PLIVO_FROM_NUMBER env or 'from' in body)"},
+            status_code=503,
+        )
+
+    def _create_call():
+        # requests is already in requirements.txt (KokoroTTSService needs
+        # it); blocking call, so it runs in a thread (see below).
+        import requests
+
+        resp = requests.post(
+            f"https://api.plivo.com/v1/Account/{PLIVO_AUTH_ID}/Call/",
+            auth=(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN),
+            json={
+                "from": from_number,
+                "to": to_number,
+                "answer_url": answer_url,
+                "answer_method": "POST",
+            },
+            timeout=30,
+        )
+        return resp.status_code, resp.text
+
+    try:
+        status_code, text = await asyncio.to_thread(_create_call)
+    except Exception as exc:
+        log.exception("plivo-call: request to Plivo API failed: %s", exc)
+        return JSONResponse(
+            {"error": "could not reach the Plivo API, please try again"},
+            status_code=502,
+        )
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = {"raw": text}
+    if status_code >= 400:
+        log.warning("plivo-call: Plivo API %s: %s", status_code, text[:500])
+        return JSONResponse(
+            {
+                "error": "Plivo rejected the call",
+                "plivo_status": status_code,
+                "plivo_response": payload,
+            },
+            status_code=502,
+        )
+    log.info("plivo-call: created call to %s: %s", to_number, payload)
+    return JSONResponse(
+        {
+            "status": "created",
+            "to": to_number,
+            "from": from_number,
+            "answer_url": answer_url,
+            **payload,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

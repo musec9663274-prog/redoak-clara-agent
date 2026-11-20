@@ -15,6 +15,9 @@ One FastAPI app serves both the Twilio phone leg and the `/talk` test endpoint.
 | GET | `/health` | Liveness + model status (keep-warm cron pings this) |
 | POST | `/twilio-voice` | TwiML: streams the call to `wss://<PUBLIC_HOST>/ws` |
 | WS | `/ws` | Twilio media stream → Pipecat pipeline |
+| POST | `/plivo-voice` | Plivo XML: streams the call to `wss://<PUBLIC_HOST>/ws-plivo` |
+| WS | `/ws-plivo` | Plivo audio stream → same Pipecat pipeline |
+| POST | `/plivo-call` | Dial out through Plivo (Clara calls a number) |
 | POST | `/talk` | wav upload → Clara reply (JSON with base64 wav, or `?format=wav` for raw wav) |
 
 `/talk` accepts a multipart `file` field or a raw wav body, and returns
@@ -38,6 +41,9 @@ for calls, `leads/talk-<timestamp>.json` for `/talk`).
 | `KOKORO_MODEL_PATH` | `./models/kokoro-v1.0.onnx` | Pre-downloaded in the Docker build |
 | `KOKORO_VOICES_PATH` | `./models/voices-v1.0.bin` | Pre-downloaded in the Docker build |
 | `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` | (empty) | Only needed for the Twilio media stream serializer |
+| `PLIVO_AUTH_ID` / `PLIVO_AUTH_TOKEN` | (empty) | Plivo account credentials; needed for dial-out and auto hang-up (`/ws-plivo` runs with auto hang-up disabled without them) |
+| `PLIVO_FROM_NUMBER` | (empty) | Voice-enabled Plivo number used as the caller ID for `/plivo-call` |
+| `PLIVO_CALL_TOKEN` | (empty) | Optional shared secret for `/plivo-call` (header `X-Plivo-Call-Token`); unset = no check |
 | `MAX_CALL_SECONDS` | `300` | Calls end after this |
 
 ## Twilio setup (after deploy)
@@ -45,6 +51,20 @@ for calls, `leads/talk-<timestamp>.json` for `/talk`).
 1. In Twilio, set the phone number's voice webhook to
    `https://<PUBLIC_HOST>/twilio-voice`.
 2. Call the number: Clara answers. The transcript is saved to `leads/<call_sid>.json`.
+
+## Plivo setup (after deploy)
+
+1. In the Plivo console, create an XML application with Answer URL
+   `https://<PUBLIC_HOST>/plivo-voice` (POST) and assign it to a
+   voice-enabled Plivo number.
+2. Set `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN` and `PLIVO_FROM_NUMBER` on the
+   host (Cloady env vars), then redeploy.
+3. Call the number: Clara answers (inbound). Or dial out:
+   `POST /plivo-call` with `{"to": "+1..."}`. The transcript is saved
+   to `leads/<call_id>.json`.
+4. `/plivo-voice` and `/ws-plivo` work with no credentials configured
+   (auto hang-up is disabled until the credentials are set); only
+   `/plivo-call` needs the account.
 
 ## Render free-plan caveats
 
