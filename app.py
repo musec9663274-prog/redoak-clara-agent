@@ -23,10 +23,12 @@ same endpoints, same models, same prompt/KB files.
 
 import asyncio
 import base64
+import gc
 import io
 import json
 import logging
 import os
+import re
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +70,7 @@ TALK_LLM_TIMEOUT_S = 60         # one Pollinations LLM call
 TALK_PIPELINE_TIMEOUT_S = 150   # whole STT -> LLM -> TTS pipeline
 TALK_LOCK_TIMEOUT_S = 10        # wait this long for a busy server, then 503
 TALK_MAX_AUDIO_SECONDS = 120    # server-side cap on uploaded audio length
+MAX_TTS_CHUNK_CHARS = 80        # synthesize long replies in chunks (below)
 
 LEADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -129,6 +132,85 @@ def get_tts_engine():
         log.info("loading kokoro model %s", KOKORO_MODEL_PATH)
         _tts_engine = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
     return _tts_engine
+
+
+def unload_stt_model():
+    """Drop the whisper model after transcribing (frees ~250MB)."""
+    global _stt_model
+    if _stt_model is not None:
+        _stt_model = None
+        gc.collect()
+
+
+def unload_tts_engine():
+    """Drop the kokoro engine after synthesis (frees ~400MB)."""
+    global _tts_engine
+    if _tts_engine is not None:
+        _tts_engine = None
+        gc.collect()
+
+
+def _split_tts_chunks(text: str, max_chars: int = MAX_TTS_CHUNK_CHARS) -> list[str]:
+    """Split reply text into short chunks for TTS.
+
+    Kokoro's onnxruntime workspace grows with input length (a 200-char
+    reply adds ~320MB RSS over the loaded model; a 50-char chunk adds
+    ~95MB). Short chunks keep the TTS peak near ~550MB instead of ~770MB.
+    """
+    # Don't split after common abbreviations ("Dr. Petel" must stay whole).
+    abbrev = r"(?<!\bDr\.)(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bSt\.)(?<!\bSr\.)(?<!\bJr\.)(?<!\bvs\.)(?<!\be\.g\.)(?<!\bi\.e\.)"
+    sentences = [s.strip() for s in re.split(abbrev + r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    chunks: list[str] = []
+    for sent in sentences:
+        if len(sent) <= max_chars:
+            chunks.append(sent)
+            continue
+        # Long sentence: split on commas, then on word boundaries.
+        parts = [p.strip() for p in sent.split(", ") if p.strip()]
+        buf = ""
+        for part in parts:
+            piece = (buf + ", " + part).strip(", ") if buf else part
+            if len(piece) <= max_chars:
+                buf = piece
+                continue
+            if buf:
+                chunks.append(buf)
+            buf = part
+            while len(buf) > max_chars:
+                cut = buf.rfind(" ", 0, max_chars)
+                if cut <= 0:
+                    cut = max_chars
+                chunks.append(buf[:cut].strip())
+                buf = buf[cut:].strip()
+        if buf:
+            chunks.append(buf)
+    return chunks or [text]
+
+
+def synthesize_chunked(tts_engine, text: str, sample_rate_hint: int = 24000):
+    """Synthesize text chunk by chunk (see _split_tts_chunks).
+
+    Returns (audio, sample_rate). A short silence gap is added between
+    chunks so the joined reply still sounds natural. Blocking — call it
+    from a thread.
+    """
+    chunks = [c for c in _split_tts_chunks(text) if c.strip()]
+    if not chunks:
+        return np.zeros(int(sample_rate_hint * 0.1), dtype=np.float32), sample_rate_hint
+    pieces: list[np.ndarray] = []
+    sample_rate = sample_rate_hint
+    gap = np.zeros(int(sample_rate_hint * 0.15), dtype=np.float32)
+    for i, chunk in enumerate(chunks):
+        audio, sample_rate = tts_engine.create(
+            chunk, voice=KOKORO_VOICE, speed=1.0, lang="en-us"
+        )
+        pieces.append(np.asarray(audio, dtype=np.float32))
+        if i < len(chunks) - 1:
+            pieces.append(gap)
+    return (
+        np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32),
+        int(sample_rate),
+    )
 
 
 def llm_client_kwargs():
@@ -460,12 +542,20 @@ async def _run_talk_pipeline(request: Request, audio_np: np.ndarray):
     """STT -> LLM -> TTS. Every blocking step runs in a thread, so the event
     loop stays free and /health answers while a call is in progress.
     Returns (user_text, agent_text, wav_bytes, sample_rate).
+
+    Models are loaded per phase and unloaded right after: keeping whisper +
+    kokoro resident together uses ~1GB RSS and a /talk peaks at ~1.3GB,
+    which OOM-kills the 1GB container (20 Nov: two crash-restarts mid-call).
+    Reloading per call costs ~10-20s but keeps peak RSS near ~750MB.
     """
     # 1. Transcribe (fresh context per call — no history carried over).
     stt_model = await asyncio.to_thread(get_stt_model)
-    segments, _info = await asyncio.to_thread(
-        stt_model.transcribe, audio_np, beam_size=1
-    )
+    try:
+        segments, _info = await asyncio.to_thread(
+            stt_model.transcribe, audio_np, beam_size=1
+        )
+    finally:
+        await asyncio.to_thread(unload_stt_model)
     user_text = " ".join(seg.text for seg in segments).strip()
     if not user_text:
         user_text = "(no speech detected)"
@@ -484,14 +574,17 @@ async def _run_talk_pipeline(request: Request, audio_np: np.ndarray):
     if await request.is_disconnected():
         raise _ClientGone("client disconnected after LLM")
 
-    # 3. Text to speech.
+    # 3. Text to speech (chunked — see synthesize_chunked).
     tts_engine = await asyncio.to_thread(get_tts_engine)
-    audio, sample_rate = await asyncio.to_thread(
-        tts_engine.create, agent_text, voice=KOKORO_VOICE, speed=1.0, lang="en-us"
-    )
-    wav_bytes = await asyncio.to_thread(
-        pcm_to_wav_bytes, np.asarray(audio, dtype=np.float32), int(sample_rate)
-    )
+    try:
+        audio, sample_rate = await asyncio.to_thread(
+            synthesize_chunked, tts_engine, agent_text
+        )
+        wav_bytes = await asyncio.to_thread(
+            pcm_to_wav_bytes, np.asarray(audio, dtype=np.float32), int(sample_rate)
+        )
+    finally:
+        await asyncio.to_thread(unload_tts_engine)
     return user_text, agent_text, wav_bytes, int(sample_rate)
 
 
@@ -573,6 +666,14 @@ async def talk(request: Request, file: UploadFile | None = File(default=None)):
             return JSONResponse(
                 {"error": "Clara took too long to reply, please try again"},
                 status_code=504,
+            )
+        except Exception as exc:
+            # e.g. the LLM service timing out or erroring — fail cleanly
+            # with a 502 instead of an unhandled 500.
+            log.exception("/talk: pipeline failed: %s", exc)
+            return JSONResponse(
+                {"error": "Clara's reply failed, please try again"},
+                status_code=502,
             )
     finally:
         _talk_lock.release()

@@ -213,8 +213,10 @@
         if (d && d.status === "ok") {
           pill.className = "pill online";
           pill.textContent = "Online";
-          $("sttVal").textContent = d.stt_loaded ? "Loaded" : "Not loaded";
-          $("ttsVal").textContent = d.tts_loaded ? "Loaded" : "Not loaded";
+          // Models load on demand per call (to fit the 1GB server), so
+          // "Ready" means the server can use them, not that they are resident.
+          $("sttVal").textContent = "Ready";
+          $("ttsVal").textContent = "Ready";
           $("llmVal").textContent = d.llm_backend || "\u2014";
         } else {
           throw new Error("unexpected response");
