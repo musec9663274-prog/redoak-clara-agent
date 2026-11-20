@@ -62,6 +62,13 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 LEADS_DIR = Path(os.environ.get("LEADS_DIR", str(BASE_DIR / "leads")))
 MAX_CALL_SECONDS = int(os.environ.get("MAX_CALL_SECONDS", "300"))
 
+# /talk limits (free tier: a fraction of one CPU — bound every stage so a
+# single long call cannot choke the server or queue behind it forever).
+TALK_LLM_TIMEOUT_S = 60         # one Pollinations LLM call
+TALK_PIPELINE_TIMEOUT_S = 150   # whole STT -> LLM -> TTS pipeline
+TALK_LOCK_TIMEOUT_S = 10        # wait this long for a busy server, then 503
+TALK_MAX_AUDIO_SECONDS = 120    # server-side cap on uploaded audio length
+
 LEADS_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
@@ -136,7 +143,9 @@ async def chat_reply(user_text: str, system: str = SYSTEM_WITH_KB) -> str:
     from openai import AsyncOpenAI
 
     base_url, model = llm_client_kwargs()
-    client = AsyncOpenAI(api_key="not-needed", base_url=base_url)
+    client = AsyncOpenAI(
+        api_key="not-needed", base_url=base_url, timeout=TALK_LLM_TIMEOUT_S
+    )
     resp = await client.chat.completions.create(
         model=model,
         messages=[
@@ -180,13 +189,34 @@ def wav_bytes_to_float16k(audio_bytes: bytes) -> np.ndarray:
         audio = audio.reshape(-1, channels).mean(axis=1)
     if framerate != 16000:
         # Linear resample to 16kHz (whisper expects 16kHz ndarray input).
+        # Done with output-sized float32 index arrays on purpose: the old
+        # np.interp(np.linspace(...), np.arange(len)) built two float64
+        # arrays as large as the INPUT (115MB for 7 min at 48kHz), which
+        # could OOM the 1GB container on top of the loaded models. This
+        # version only allocates output-sized arrays (positions stay
+        # float64 — float32 loses index precision on long inputs).
         n_out = int(round(len(audio) * 16000 / framerate))
-        audio = np.interp(
-            np.linspace(0, len(audio) - 1, n_out),
-            np.arange(len(audio)),
-            audio,
+        pos = np.linspace(0, len(audio) - 1, n_out)
+        i0 = np.floor(pos).astype(np.int32)
+        frac = pos - i0
+        i1 = np.minimum(i0 + 1, len(audio) - 1)
+        audio = (
+            audio[i0] * (1.0 - frac) + audio[i1] * frac
         ).astype(np.float32)
     return np.ascontiguousarray(audio, dtype=np.float32)
+
+
+def wav_duration_seconds(audio_bytes: bytes) -> float | None:
+    """Read a wav's duration from its header only — no sample decode, so a
+    huge upload can be rejected before it ever allocates big arrays.
+    Returns None when the bytes are not a readable wav header."""
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            if wf.getframerate() <= 0:
+                return None
+            return wf.getnframes() / wf.getframerate()
+    except (wave.Error, EOFError):
+        return None
 
 
 def pcm_to_wav_bytes(audio: np.ndarray, sample_rate: int) -> bytes:
@@ -422,6 +452,49 @@ async def twilio_ws(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 
 
+class _ClientGone(Exception):
+    """The /talk client disconnected mid-call; abort instead of crunching on."""
+
+
+async def _run_talk_pipeline(request: Request, audio_np: np.ndarray):
+    """STT -> LLM -> TTS. Every blocking step runs in a thread, so the event
+    loop stays free and /health answers while a call is in progress.
+    Returns (user_text, agent_text, wav_bytes, sample_rate).
+    """
+    # 1. Transcribe (fresh context per call — no history carried over).
+    stt_model = await asyncio.to_thread(get_stt_model)
+    segments, _info = await asyncio.to_thread(
+        stt_model.transcribe, audio_np, beam_size=1
+    )
+    user_text = " ".join(seg.text for seg in segments).strip()
+    if not user_text:
+        user_text = "(no speech detected)"
+
+    if await request.is_disconnected():
+        raise _ClientGone("client disconnected after STT")
+
+    # 2. LLM reply.
+    agent_text = await chat_reply(user_text)
+    if not agent_text:
+        agent_text = (
+            "Sorry, I didn't catch that. Could you tell me a little about "
+            "your practice's billing setup?"
+        )
+
+    if await request.is_disconnected():
+        raise _ClientGone("client disconnected after LLM")
+
+    # 3. Text to speech.
+    tts_engine = await asyncio.to_thread(get_tts_engine)
+    audio, sample_rate = await asyncio.to_thread(
+        tts_engine.create, agent_text, voice=KOKORO_VOICE, speed=1.0, lang="en-us"
+    )
+    wav_bytes = await asyncio.to_thread(
+        pcm_to_wav_bytes, np.asarray(audio, dtype=np.float32), int(sample_rate)
+    )
+    return user_text, agent_text, wav_bytes, int(sample_rate)
+
+
 @app.post("/talk")
 async def talk(request: Request, file: UploadFile | None = File(default=None)):
     """Accept a wav upload (multipart `file` field, or raw wav body).
@@ -431,6 +504,11 @@ async def talk(request: Request, file: UploadFile | None = File(default=None)):
        "audio_base64": ..., "sample_rate": 24000, "format": "wav"}
     With ?format=wav the reply wav bytes are returned directly, with the
     transcripts in X-User-Transcript / X-Agent-Transcript headers.
+
+    Guardrails (free tier, one slow CPU): audio is capped at 120s, the
+    pipeline fails fast after 150s (504), and a busy server answers 503
+    instead of queueing forever. Nothing here blocks the event loop, so
+    /health stays fast while a call runs.
     """
     audio_bytes: bytes | None = None
     if file is not None:
@@ -445,40 +523,64 @@ async def talk(request: Request, file: UploadFile | None = File(default=None)):
 
     want_wav = request.query_params.get("format", "").lower() == "wav"
 
+    # Reject over-long audio from the WAV header BEFORE decoding: decoding a
+    # multi-minute recording allocates hundreds of MB of numpy temporaries,
+    # which OOM-killed the 1GB container (20 Nov: /talk 502'd, container
+    # restarted with models unloaded).
+    header_s = wav_duration_seconds(audio_bytes)
+    if header_s is not None and header_s > TALK_MAX_AUDIO_SECONDS:
+        return JSONResponse(
+            {"error": f"audio too long ({header_s:.0f}s, max {TALK_MAX_AUDIO_SECONDS}s)"},
+            status_code=400,
+        )
+
+    # Decode off the event loop: for a long recording the numpy resample
+    # takes seconds, which used to freeze /health mid-call.
     try:
-        audio_np = wav_bytes_to_float16k(audio_bytes)
+        audio_np = await asyncio.to_thread(wav_bytes_to_float16k, audio_bytes)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    async with _talk_lock:
-        # 1. Transcribe (fresh context per call — no history carried over).
-        stt_model = await asyncio.to_thread(get_stt_model)
-        segments, _info = await asyncio.to_thread(
-            stt_model.transcribe, audio_np, beam_size=1
+    duration_s = len(audio_np) / 16000
+    if duration_s > TALK_MAX_AUDIO_SECONDS:
+        return JSONResponse(
+            {"error": f"audio too long ({duration_s:.0f}s, max {TALK_MAX_AUDIO_SECONDS}s)"},
+            status_code=400,
         )
-        user_text = " ".join(seg.text for seg in segments).strip()
 
-        if not user_text:
-            user_text = "(no speech detected)"
+    # One request at a time, but never queue forever.
+    try:
+        await asyncio.wait_for(_talk_lock.acquire(), timeout=TALK_LOCK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "server busy, please try again in a moment"}, status_code=503
+        )
 
-        # 2. LLM reply.
-        agent_text = await chat_reply(user_text)
-        if not agent_text:
-            agent_text = (
-                "Sorry, I didn't catch that. Could you tell me a little about "
-                "your practice's billing setup?"
+    try:
+        try:
+            user_text, agent_text, wav_bytes, sample_rate = await asyncio.wait_for(
+                _run_talk_pipeline(request, audio_np),
+                timeout=TALK_PIPELINE_TIMEOUT_S,
             )
+        except _ClientGone:
+            log.info("/talk: client disconnected mid-call, aborting")
+            return JSONResponse({"error": "client disconnected"}, status_code=499)
+        except asyncio.TimeoutError:
+            log.warning(
+                "/talk: pipeline exceeded %ss, failing fast",
+                TALK_PIPELINE_TIMEOUT_S,
+            )
+            return JSONResponse(
+                {"error": "Clara took too long to reply, please try again"},
+                status_code=504,
+            )
+    finally:
+        _talk_lock.release()
 
-        # 3. Text to speech.
-        tts_engine = await asyncio.to_thread(get_tts_engine)
-        audio, sample_rate = await asyncio.to_thread(
-            tts_engine.create, agent_text, voice=KOKORO_VOICE, speed=1.0, lang="en-us"
-        )
-        wav_bytes = pcm_to_wav_bytes(np.asarray(audio, dtype=np.float32), int(sample_rate))
-
-    # 4. Save the exchange (CRM = leads/*.json).
+    # 4. Save the exchange (CRM = leads/*.json), file I/O off the loop.
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    save_lead(
+    await asyncio.to_thread(
+        save_lead,
         f"talk-{stamp}.json",
         {
             "source": "talk",
@@ -497,11 +599,12 @@ async def talk(request: Request, file: UploadFile | None = File(default=None)):
                 "X-Agent-Transcript": agent_text,
             },
         )
+    audio_b64 = await asyncio.to_thread(base64.b64encode, wav_bytes)
     return JSONResponse(
         {
             "user_transcript": user_text,
             "agent_transcript": agent_text,
-            "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
+            "audio_base64": audio_b64.decode("ascii"),
             "sample_rate": int(sample_rate),
             "format": "wav",
         }

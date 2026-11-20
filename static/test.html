@@ -127,7 +127,7 @@
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line></svg>
       <span id="micBtnLabel">Start</span>
     </button>
-    <p id="statusLine" class="status-line">Tap Start, allow the microphone, and speak.</p>
+    <p id="statusLine" class="status-line">Tap Start, allow the microphone, and speak. Recordings are limited to 30 seconds.</p>
     <div id="levelWrap" class="level-wrap"><div id="levelBar" class="level-bar"></div></div>
     <div id="errorBox" class="error-box" role="alert"></div>
     <p id="hintLine" class="hint-line">Not sure what to say? Pick a question below.</p>
@@ -170,13 +170,15 @@
   var TARGET_RATE = 16000;
   var MIC_WATCHDOG_MS = 20000;
   var TALK_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+  var MAX_REC_SECONDS = 30; // recordings auto-stop here so STT stays quick
 
   // Recorder state. mode: "pcm" (AudioContext capture) or "mediarecorder".
   var rec = {
     active: false, requesting: false, mode: null,
     stream: null, audioCtx: null, processor: null, analyser: null,
     source: null, chunks: [], mr: null, mrChunks: [],
-    watchdog: null, meterRaf: null, startTime: 0, settled: false
+    watchdog: null, meterRaf: null, capTimer: null,
+    startTime: 0, settled: false
   };
   var waitingTimer = null, waitingStarted = 0;
 
@@ -194,7 +196,7 @@
 
   function setIdle() {
     setButton("idle", "Start");
-    setStatus("Tap Start, allow the microphone, and speak.");
+    setStatus("Tap Start, allow the microphone, and speak. Recordings are limited to 30 seconds.");
     levelWrap.style.display = "none";
     levelBar.style.width = "0%";
   }
@@ -321,6 +323,30 @@
     levelWrap.style.display = "none";
   }
 
+  /* ---------------- 30-second recording cap ---------------- */
+
+  function stopCapTimer() {
+    if (rec.capTimer) { clearInterval(rec.capTimer); rec.capTimer = null; }
+  }
+
+  function startCapTimer() {
+    stopCapTimer();
+    function tick() {
+      if (!rec.active) { stopCapTimer(); return; }
+      var elapsed = Math.floor((Date.now() - rec.startTime) / 1000);
+      var left = MAX_REC_SECONDS - elapsed;
+      if (left <= 0) {
+        stopCapTimer();
+        setStatus("30 seconds reached — sending your recording to Clara\u2026");
+        onStopTap();
+        return;
+      }
+      setStatus("Recording\u2026 " + left + "s left (max 30 seconds). Tap Stop when done.");
+    }
+    tick();
+    rec.capTimer = setInterval(tick, 1000);
+  }
+
   /* ---------------- cleanup ---------------- */
 
   function teardownStream() {
@@ -337,6 +363,7 @@
 
   function resetRecorder() {
     if (rec.watchdog) { clearTimeout(rec.watchdog); rec.watchdog = null; }
+    stopCapTimer();
     stopMeter();
     teardownStream();
     rec.active = false;
@@ -494,6 +521,7 @@
     rec.startTime = Date.now();
     setButton("recording", "Stop");
     setStatus("Recording\u2026 tap Stop when you are done.");
+    startCapTimer();
   }
 
   function startPcmCapture(stream) {
@@ -525,6 +553,7 @@
     setButton("recording", "Stop");
     setStatus("Recording\u2026 tap Stop when you are done.");
     startMeter();
+    startCapTimer();
   }
 
   function micErrorMessage(err) {
