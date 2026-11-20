@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 
 # ---------------------------------------------------------------------------
 # Config
@@ -239,6 +239,13 @@ async def index():
         "service": "RedOak Clara Agent",
         "endpoints": ["GET /health", "POST /twilio-voice", "WS /ws", "POST /talk"],
     }
+
+
+@app.get("/test")
+async def live_test_page():
+    """Serve the Clara Live Test page (same origin as /talk, so the browser
+    microphone works on this top-level page)."""
+    return FileResponse(BASE_DIR / "static" / "test.html", media_type="text/html")
 
 
 # ---------------------------------------------------------------------------

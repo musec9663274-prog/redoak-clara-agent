@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clara Live Test — RedOak Global Services</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: #f4f1ec;
+    color: #222;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { text-align: center; margin-bottom: 16px; }
+  header h1 { margin: 0; font-size: 26px; }
+  header p { margin: 4px 0 0; color: #666; font-size: 14px; }
+  .card {
+    background: #fff;
+    border: 1px solid #e3ddd4;
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .card h2 { margin: 0 0 10px; font-size: 16px; }
+  /* ---- server status ---- */
+  .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    display: inline-block; padding: 4px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; background: #eee; color: #555;
+  }
+  .pill.online { background: #d9f2dd; color: #1c6b2c; }
+  .pill.offline { background: #f8d7d7; color: #8f1d1d; }
+  .pill.checking { background: #fff3cd; color: #7a5b00; }
+  .detail-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px;
+  }
+  .detail {
+    background: #f7f5f2; border-radius: 10px; padding: 10px; text-align: center;
+  }
+  .detail .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; }
+  .detail .value { font-size: 15px; font-weight: 600; margin-top: 2px; }
+  .small-btn {
+    border: 1px solid #ddd; background: #fff; border-radius: 8px;
+    padding: 6px 12px; font-size: 13px; cursor: pointer;
+  }
+  .small-btn:hover { background: #f5f5f5; }
+  /* ---- recorder ---- */
+  .recorder { text-align: center; }
+  .mic-btn {
+    width: 140px; height: 140px; border-radius: 50%; border: none; cursor: pointer;
+    background: #e89b6d; color: #222; font-size: 18px; font-weight: 700;
+    display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    transition: background .15s, transform .1s;
+  }
+  .mic-btn:active { transform: scale(0.97); }
+  .mic-btn.recording { background: #d9534f; color: #fff; }
+  .mic-btn.busy { background: #f0c36b; }
+  .mic-btn:disabled { cursor: default; opacity: 0.85; }
+  .mic-btn svg { width: 34px; height: 34px; }
+  .status-line { margin: 14px 0 0; font-size: 15px; min-height: 22px; }
+  .level-wrap {
+    height: 8px; background: #eee; border-radius: 4px; margin: 12px auto 0;
+    max-width: 280px; overflow: hidden; display: none;
+  }
+  .level-bar { height: 100%; width: 0%; background: #4caf50; border-radius: 4px; }
+  .error-box {
+    display: none; margin: 14px 0 0; padding: 12px 14px; text-align: left;
+    background: #fdecea; border: 1px solid #f5c6c0; color: #8f1d1d;
+    border-radius: 10px; font-size: 14px;
+  }
+  .error-box.show { display: block; }
+  .hint-line { margin: 14px 0 0; font-size: 14px; color: #555; min-height: 21px; }
+  .hint-line strong { color: #222; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 10px; }
+  .chip {
+    border: 1px solid #ddd; background: #f7f5f2; border-radius: 999px;
+    padding: 7px 13px; font-size: 13px; cursor: pointer;
+  }
+  .chip:hover { background: #efe9e1; }
+  /* ---- exchange + history ---- */
+  .exchange p { margin: 6px 0; }
+  .exchange .who { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: #888; }
+  .exchange .text { font-size: 16px; }
+  audio { width: 100%; margin-top: 8px; }
+  .history-item {
+    border-top: 1px solid #eee; padding: 10px 0; font-size: 14px;
+  }
+  .history-item:first-of-type { border-top: none; }
+  .history-item .q { color: #555; }
+  .history-item .a { margin-top: 2px; }
+  .muted { color: #888; font-size: 13px; }
+  @media (max-width: 480px) {
+    .detail-grid { grid-template-columns: 1fr 1fr; }
+    .mic-btn { width: 120px; height: 120px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Clara Live Test</h1>
+    <p>Talk to Clara, RedOak&rsquo;s AI billing agent, and hear her reply.</p>
+  </header>
+
+  <!-- Server status -->
+  <div class="card">
+    <div class="status-row">
+      <h2 style="margin:0">Server</h2>
+      <span id="serverPill" class="pill checking">Checking&hellip;</span>
+      <button id="refreshBtn" class="small-btn" type="button">Refresh</button>
+    </div>
+    <div class="detail-grid">
+      <div class="detail"><div class="label">Speech to text</div><div id="sttVal" class="value">&mdash;</div></div>
+      <div class="detail"><div class="label">Text to speech</div><div id="ttsVal" class="value">&mdash;</div></div>
+      <div class="detail"><div class="label">AI backend</div><div id="llmVal" class="value">&mdash;</div></div>
+    </div>
+  </div>
+
+  <!-- Recorder -->
+  <div class="card recorder">
+    <button id="micBtn" class="mic-btn" type="button" aria-label="Start recording">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line></svg>
+      <span id="micBtnLabel">Start</span>
+    </button>
+    <p id="statusLine" class="status-line">Tap Start, allow the microphone, and speak.</p>
+    <div id="levelWrap" class="level-wrap"><div id="levelBar" class="level-bar"></div></div>
+    <div id="errorBox" class="error-box" role="alert"></div>
+    <p id="hintLine" class="hint-line">Not sure what to say? Pick a question below.</p>
+    <div class="chips">
+      <button class="chip" type="button" data-q="Hi, this is Doctor Patel. How much do you charge for medical billing?">How much do you charge?</button>
+      <button class="chip" type="button" data-q="What services does RedOak Global Services offer for small practices?">What services do you offer?</button>
+      <button class="chip" type="button" data-q="Do you charge a setup fee, and is there a contract?">Setup fee and contract?</button>
+    </div>
+  </div>
+
+  <!-- Latest exchange -->
+  <div class="card exchange">
+    <h2>Latest exchange</h2>
+    <p class="who">You said</p>
+    <p id="userText" class="text muted">&mdash;</p>
+    <p class="who">Clara replied</p>
+    <p id="agentText" class="text muted">&mdash;</p>
+    <audio id="replyAudio" controls preload="none" style="display:none"></audio>
+  </div>
+
+  <!-- History -->
+  <div class="card">
+    <h2>History</h2>
+    <div id="history"><p class="muted">No exchanges yet.</p></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var micBtn = $("micBtn"), micBtnLabel = $("micBtnLabel"),
+      statusLine = $("statusLine"), errorBox = $("errorBox"),
+      levelWrap = $("levelWrap"), levelBar = $("levelBar"),
+      userText = $("userText"), agentText = $("agentText"),
+      replyAudio = $("replyAudio"), historyEl = $("history"),
+      hintLine = $("hintLine");
+
+  var TARGET_RATE = 16000;
+  var MIC_WATCHDOG_MS = 20000;
+  var TALK_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+
+  // Recorder state. mode: "pcm" (AudioContext capture) or "mediarecorder".
+  var rec = {
+    active: false, requesting: false, mode: null,
+    stream: null, audioCtx: null, processor: null, analyser: null,
+    source: null, chunks: [], mr: null, mrChunks: [],
+    watchdog: null, meterRaf: null, startTime: 0, settled: false
+  };
+  var waitingTimer = null, waitingStarted = 0;
+
+  function setStatus(text) { statusLine.textContent = text; }
+  function showError(msg) { errorBox.textContent = msg; errorBox.classList.add("show"); errorBox.scrollIntoView({ block: "nearest", behavior: "smooth" }); }
+  function hideError() { errorBox.textContent = ""; errorBox.classList.remove("show"); }
+
+  function setButton(state, label) {
+    micBtn.classList.remove("recording", "busy");
+    if (state === "recording") micBtn.classList.add("recording");
+    if (state === "busy") micBtn.classList.add("busy");
+    micBtn.disabled = (state === "busy");
+    micBtnLabel.textContent = label;
+  }
+
+  function setIdle() {
+    setButton("idle", "Start");
+    setStatus("Tap Start, allow the microphone, and speak.");
+    levelWrap.style.display = "none";
+    levelBar.style.width = "0%";
+  }
+
+  /* ---------------- server status ---------------- */
+
+  function refreshHealth() {
+    var pill = $("serverPill");
+    pill.className = "pill checking";
+    pill.textContent = "Checking\u2026";
+    fetch("/health", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (d) {
+        if (d && d.status === "ok") {
+          pill.className = "pill online";
+          pill.textContent = "Online";
+          $("sttVal").textContent = d.stt_loaded ? "Loaded" : "Not loaded";
+          $("ttsVal").textContent = d.tts_loaded ? "Loaded" : "Not loaded";
+          $("llmVal").textContent = d.llm_backend || "\u2014";
+        } else {
+          throw new Error("unexpected response");
+        }
+      })
+      .catch(function () {
+        pill.className = "pill offline";
+        pill.textContent = "Unreachable";
+        $("sttVal").textContent = "\u2014";
+        $("ttsVal").textContent = "\u2014";
+        $("llmVal").textContent = "\u2014";
+      });
+  }
+  $("refreshBtn").addEventListener("click", refreshHealth);
+  refreshHealth();
+
+  /* ---------------- question chips ---------------- */
+
+  document.querySelectorAll(".chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      hintLine.innerHTML = "Say: <strong>\u201c" + chip.getAttribute("data-q") + "\u201d</strong>";
+    });
+  });
+
+  /* ---------------- WAV encoding ---------------- */
+
+  function resampleTo16k(samples, sourceRate) {
+    if (sourceRate === TARGET_RATE) return samples;
+    var ratio = sourceRate / TARGET_RATE;
+    var outLen = Math.floor(samples.length / ratio);
+    var out = new Float32Array(outLen);
+    for (var i = 0; i < outLen; i++) {
+      var pos = i * ratio;
+      var i0 = Math.floor(pos), i1 = Math.min(i0 + 1, samples.length - 1);
+      var frac = pos - i0;
+      out[i] = samples[i0] * (1 - frac) + samples[i1] * frac;
+    }
+    return out;
+  }
+
+  function encodeWav(samples, sampleRate) {
+    var buf = new ArrayBuffer(44 + samples.length * 2);
+    var view = new DataView(buf);
+    function writeStr(off, s) { for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); }
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    for (var i = 0; i < samples.length; i++) {
+      var s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
+  function mergeChunks(chunks) {
+    var len = 0;
+    chunks.forEach(function (c) { len += c.length; });
+    var out = new Float32Array(len), off = 0;
+    chunks.forEach(function (c) { out.set(c, off); off += c.length; });
+    return out;
+  }
+
+  function maxAbs(samples) {
+    var m = 0;
+    for (var i = 0; i < samples.length; i++) {
+      var a = Math.abs(samples[i]);
+      if (a > m) m = a;
+    }
+    return m;
+  }
+
+  /* ---------------- level meter ---------------- */
+
+  function startMeter() {
+    if (!rec.analyser) return;
+    var data = new Uint8Array(rec.analyser.fftSize);
+    levelWrap.style.display = "block";
+    function tick() {
+      if (!rec.active) return;
+      rec.analyser.getByteTimeDomainData(data);
+      var sum = 0;
+      for (var i = 0; i < data.length; i++) {
+        var v = (data[i] - 128) / 128;
+        sum += v * v;
+      }
+      var rms = Math.sqrt(sum / data.length);
+      levelBar.style.width = Math.min(100, rms * 400) + "%";
+      rec.meterRaf = requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  function stopMeter() {
+    if (rec.meterRaf) cancelAnimationFrame(rec.meterRaf);
+    rec.meterRaf = null;
+    levelWrap.style.display = "none";
+  }
+
+  /* ---------------- cleanup ---------------- */
+
+  function teardownStream() {
+    if (rec.processor) { try { rec.processor.disconnect(); } catch (e) {} rec.processor = null; }
+    if (rec.source) { try { rec.source.disconnect(); } catch (e) {} rec.source = null; }
+    if (rec.analyser) { try { rec.analyser.disconnect(); } catch (e) {} rec.analyser = null; }
+    if (rec.audioCtx) { var ctx = rec.audioCtx; rec.audioCtx = null; ctx.close().catch(function () {}); }
+    if (rec.stream) { rec.stream.getTracks().forEach(function (t) { t.stop(); }); rec.stream = null; }
+    if (rec.mr && rec.mr.state !== "inactive") { try { rec.mr.stop(); } catch (e) {} }
+    rec.mr = null;
+    rec.chunks = [];
+    rec.mrChunks = [];
+  }
+
+  function resetRecorder() {
+    if (rec.watchdog) { clearTimeout(rec.watchdog); rec.watchdog = null; }
+    stopMeter();
+    teardownStream();
+    rec.active = false;
+    rec.requesting = false;
+    rec.settled = false;
+    rec.mode = null;
+  }
+
+  /* ---------------- /talk ---------------- */
+
+  function startWaitingTimer() {
+    waitingStarted = Date.now();
+    setStatus("Sending to Clara\u2026 0s (first reply can take up to ~2 minutes)");
+    waitingTimer = setInterval(function () {
+      var s = Math.floor((Date.now() - waitingStarted) / 1000);
+      setStatus("Clara is thinking\u2026 " + s + "s (first reply can take up to ~2 minutes)");
+    }, 1000);
+  }
+
+  function stopWaitingTimer() {
+    if (waitingTimer) { clearInterval(waitingTimer); waitingTimer = null; }
+  }
+
+  function addHistory(user, agent) {
+    var empty = historyEl.querySelector("p.muted");
+    if (empty) empty.remove();
+    var div = document.createElement("div");
+    div.className = "history-item";
+    var q = document.createElement("div");
+    q.className = "q";
+    q.textContent = "You: " + user;
+    var a = document.createElement("div");
+    a.className = "a";
+    a.textContent = "Clara: " + agent;
+    div.appendChild(q);
+    div.appendChild(a);
+    historyEl.insertBefore(div, historyEl.firstChild);
+    while (historyEl.children.length > 8) historyEl.removeChild(historyEl.lastChild);
+  }
+
+  function playReply(base64, sampleRate) {
+    var binary = atob(base64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    var blob = new Blob([bytes], { type: "audio/wav" });
+    var url = URL.createObjectURL(blob);
+    replyAudio.src = url;
+    replyAudio.style.display = "block";
+    var p = replyAudio.play();
+    if (p && p.catch) p.catch(function () { /* user can press play manually */ });
+  }
+
+  function sendToTalk(wavBlob) {
+    setButton("busy", "Wait\u2026");
+    startWaitingTimer();
+    var form = new FormData();
+    form.append("file", wavBlob, "recording.wav");
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function () { controller.abort(); }, TALK_TIMEOUT_MS);
+    fetch("/talk", { method: "POST", body: form, signal: controller.signal })
+      .then(function (r) {
+        clearTimeout(timeoutId);
+        if (!r.ok) throw new Error("Server returned HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (d) {
+        stopWaitingTimer();
+        if (!d || typeof d.agent_transcript !== "string") throw new Error("Unexpected server reply.");
+        userText.textContent = d.user_transcript || "\u2014";
+        userText.classList.remove("muted");
+        agentText.textContent = d.agent_transcript;
+        agentText.classList.remove("muted");
+        addHistory(d.user_transcript || "(no speech detected)", d.agent_transcript);
+        setIdle();
+        setStatus("Clara is speaking. Tap Start to ask something else.");
+        if (d.audio_base64) playReply(d.audio_base64, d.sample_rate || 24000);
+        refreshHealth();
+      })
+      .catch(function (err) {
+        clearTimeout(timeoutId);
+        stopWaitingTimer();
+        setIdle();
+        if (err && err.name === "AbortError") {
+          showError("Clara took too long to reply (over 4 minutes). The server may be busy — please try again.");
+        } else {
+          showError("Could not reach Clara: " + (err && err.message ? err.message : "server unreachable") + ". Check the server status above and try again.");
+        }
+      });
+  }
+
+  /* ---------------- recording ---------------- */
+
+  function finishPcmRecording() {
+    var samples = mergeChunks(rec.chunks);
+    var rate = rec.audioCtx ? rec.audioCtx.sampleRate : TARGET_RATE;
+    resetRecorder();
+    var seconds = samples.length / rate;
+    if (seconds < 0.4) {
+      setIdle();
+      showError("That recording was too short — please hold Start, speak, then tap Stop.");
+      return;
+    }
+    if (maxAbs(samples) < 0.005) {
+      setIdle();
+      showError("No sound was recorded — the microphone may be muted or too quiet. Please try again.");
+      return;
+    }
+    var wav = encodeWav(resampleTo16k(samples, rate), TARGET_RATE);
+    sendToTalk(wav);
+  }
+
+  function startMediaRecorderFallback(stream) {
+    // Fallback for browsers without ScriptProcessor: record with
+    // MediaRecorder, then decode + resample to 16kHz WAV in the browser.
+    rec.mode = "mediarecorder";
+    rec.mrChunks = [];
+    var mr = new MediaRecorder(stream);
+    rec.mr = mr;
+    mr.ondataavailable = function (e) { if (e.data && e.data.size) rec.mrChunks.push(e.data); };
+    mr.onstop = function () {
+      var blob = new Blob(rec.mrChunks, { type: mr.mimeType || "audio/webm" });
+      var ctx = rec.audioCtx;
+      resetRecorder();
+      if (!blob.size) {
+        setIdle();
+        showError("No sound was recorded — please try again.");
+        return;
+      }
+      setButton("busy", "Wait\u2026");
+      setStatus("Preparing your recording\u2026");
+      blob.arrayBuffer().then(function (buf) {
+        return ctx.decodeAudioData(buf);
+      }).then(function (decoded) {
+        var samples = decoded.getChannelData(0);
+        if (decoded.numberOfChannels > 1) {
+          var other = decoded.getChannelData(1);
+          var mixed = new Float32Array(samples.length);
+          for (var i = 0; i < samples.length; i++) mixed[i] = (samples[i] + other[i]) / 2;
+          samples = mixed;
+        }
+        if (samples.length / decoded.sampleRate < 0.4 || maxAbs(samples) < 0.005) {
+          setIdle();
+          showError("No sound was recorded — the microphone may be muted or too quiet. Please try again.");
+          return;
+        }
+        var wav = encodeWav(resampleTo16k(samples, decoded.sampleRate), TARGET_RATE);
+        sendToTalk(wav);
+      }).catch(function () {
+        setIdle();
+        showError("Could not read the recording from this browser. Please try Chrome on a computer.");
+      });
+    };
+    mr.start(250);
+    rec.active = true;
+    rec.startTime = Date.now();
+    setButton("recording", "Stop");
+    setStatus("Recording\u2026 tap Stop when you are done.");
+  }
+
+  function startPcmCapture(stream) {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC || !AC.prototype.createScriptProcessor) {
+      // No ScriptProcessor: fall back to MediaRecorder (needs an AudioContext
+      // only for decoding, created lazily below).
+      rec.audioCtx = new AC();
+      startMediaRecorderFallback(stream);
+      return;
+    }
+    rec.mode = "pcm";
+    rec.audioCtx = new AC();
+    var ctx = rec.audioCtx;
+    if (ctx.state === "suspended") ctx.resume().catch(function () {});
+    rec.source = ctx.createMediaStreamSource(stream);
+    rec.analyser = ctx.createAnalyser();
+    rec.analyser.fftSize = 2048;
+    rec.source.connect(rec.analyser);
+    rec.processor = ctx.createScriptProcessor(4096, 1, 1);
+    rec.chunks = [];
+    rec.processor.onaudioprocess = function (e) {
+      rec.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    rec.source.connect(rec.processor);
+    rec.processor.connect(ctx.destination); // required for onaudioprocess to fire
+    rec.active = true;
+    rec.startTime = Date.now();
+    setButton("recording", "Stop");
+    setStatus("Recording\u2026 tap Stop when you are done.");
+    startMeter();
+  }
+
+  function micErrorMessage(err) {
+    var name = err && err.name ? err.name : "";
+    if (name === "NotAllowedError" || name === "SecurityError") {
+      return "Microphone access was blocked. Allow the microphone for this site in the browser\u2019s address bar (mic icon) or site settings, then tap Start again.";
+    }
+    if (name === "NotFoundError" || name === "OverconstrainedError") {
+      return "No microphone was found on this device. Connect a microphone and try again.";
+    }
+    if (name === "NotReadableError") {
+      return "The microphone is busy in another app or tab. Close the other app or tab and try again.";
+    }
+    return "Could not access the microphone (" + (err && err.message ? err.message : "unknown error") + "). Please try again.";
+  }
+
+  function onStartTap() {
+    // Instant feedback FIRST — the button must never look dead.
+    hideError();
+    setButton("busy", "Asking\u2026");
+    setStatus("Asking for microphone access\u2026");
+    rec.requesting = true;
+    rec.settled = false;
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      rec.requesting = false;
+      setIdle();
+      showError("This browser cannot access the microphone from this page. Please open this page directly in Chrome or Safari on a computer.");
+      return;
+    }
+
+    // Watchdog: if the permission prompt never settles (some in-app browsers
+    // never show it), say so instead of hanging silently.
+    rec.watchdog = setTimeout(function () {
+      if (rec.settled || !rec.requesting) return;
+      rec.requesting = false;
+      resetRecorder();
+      setIdle();
+      showError("The microphone prompt never appeared. This page may be open inside an app that blocks the microphone — please open it directly in Chrome or Safari and tap Start again.");
+    }, MIC_WATCHDOG_MS);
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      rec.settled = true;
+      if (rec.watchdog) { clearTimeout(rec.watchdog); rec.watchdog = null; }
+      if (!rec.requesting) { // watchdog already fired; drop the late stream
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        return;
+      }
+      rec.requesting = false;
+      rec.stream = stream;
+      startPcmCapture(stream);
+    }).catch(function (err) {
+      rec.settled = true;
+      if (rec.watchdog) { clearTimeout(rec.watchdog); rec.watchdog = null; }
+      rec.requesting = false;
+      resetRecorder();
+      setIdle();
+      showError(micErrorMessage(err));
+    });
+  }
+
+  function onStopTap() {
+    if (rec.mode === "mediarecorder" && rec.mr && rec.mr.state !== "inactive") {
+      setButton("busy", "Wait\u2026");
+      setStatus("Finishing your recording\u2026");
+      rec.active = false;
+      stopMeter();
+      try { rec.mr.stop(); } catch (e) { resetRecorder(); setIdle(); showError("Recording stopped unexpectedly. Please try again."); }
+      return;
+    }
+    setButton("busy", "Wait\u2026");
+    setStatus("Finishing your recording\u2026");
+    finishPcmRecording();
+  }
+
+  micBtn.addEventListener("click", function () {
+    if (micBtn.disabled) return; // busy (asking / sending) — ignore extra taps
+    if (rec.active) { onStopTap(); return; }
+    onStartTap();
+  });
+})();
+</script>
+</body>
+</html>
